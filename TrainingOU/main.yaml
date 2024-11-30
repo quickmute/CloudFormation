@@ -1,0 +1,138 @@
+### StackSet Info
+### Permission Model: Service_managed
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates a cross-account IAM role into Training Accounts'
+
+Parameters:
+  TrainingRoleName:
+    Type: String
+    Description: Name of the IAM role to create
+    Default: DCEAdmin
+  
+  TrainingAccountId:
+    Type: String
+    Description: AWS Account ID of the training account
+    AllowedPattern: '[0-9]{12}'
+
+  AliasPrefix:
+    Type: String
+    Description: prefix for alias
+    Default: 'aws'
+
+Resources:
+  CrossAccountRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref TrainingRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${TrainingAccountId}:root'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+      Tags:
+        - Key: Purpose
+          Value: CrossAccountAccess
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: IAMAliasManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateAccountAlias'
+                  - 'iam:DeleteAccountAlias'
+                  - 'iam:ListAccountAliases'
+                Resource: '*'
+
+  IAMAccountAliasFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Runtime: python3.13
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+          import re
+
+          def validate_alias(alias):
+              if not re.match('^[a-z0-9][a-z0-9-]*[a-z0-9]$', alias):
+                  raise ValueError('Invalid alias format')
+              if len(alias) > 63:
+                  raise ValueError('Alias too long')
+          
+          def retry_operation(operation, max_attempts=3):
+              for attempt in range(max_attempts):
+                  try:
+                      return operation()
+                  except Exception as e:
+                      if attempt == max_attempts - 1:
+                          raise
+                      time.sleep(2 ** attempt)
+          
+          def handler(event, context):
+              iam = boto3.client('iam')
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      alias = event['ResourceProperties']['IAMAccountAlias']
+                      validate_alias(alias)
+                      print(alias)
+
+                      def update_alias():
+                          existing = iam.list_account_aliases()['AccountAliases']
+                          if existing:
+                              iam.delete_account_alias(AccountAlias=existing[0])
+                              print("Alias Deleted")
+                          iam.create_account_alias(AccountAlias=alias)
+                          print("Alias Created")
+                      
+                      retry_operation(update_alias)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Alias': alias})
+                  elif event['RequestType'] == 'Delete':
+                      retry_operation(lambda: iam.delete_account_alias(
+                          AccountAlias=iam.list_account_aliases()['AccountAliases'][0]
+                      ) if iam.list_account_aliases()['AccountAliases'] else None)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      print("Alias Deleted")
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+  
+  IAMAccountAlias:
+    Type: 'Custom::IAMAccountAlias'
+    Properties:
+      ServiceToken: !GetAtt IAMAccountAliasFunction.Arn
+      IAMAccountAlias: !Join 
+        - '-'
+        - - !Ref AliasPrefix
+          - !Ref 'AWS::AccountId'
+
+Outputs:
+  CrossAccountRoleARN:
+    Description: ARN of the created IAM role
+    Value: !GetAtt CrossAccountRole.Arn
+
+  IAMAccountAlias:
+    Description: 'Created IAM Account Alias'
+    Value: !Join 
+        - '-'
+        - - !Ref AliasPrefix
+          - !Ref 'AWS::AccountId'
